@@ -98,6 +98,16 @@ std::pair<bool, std::vector<_u64>> get_disk_index_meta(const std::string &path) 
 
 class graph_partitioner {
  public:
+  // Default constructor for use with custom graph format
+  graph_partitioner() : _nd(0), _dim(0), _max_node_len(0), _width(0), _ep(0),
+                        C(0), _partition_number(0), cur(0), round(0), ivf_time(0.0),
+                        _visual(false), cursize(10000), select_nums(0), getUnfilled_nums(0), E(0) {
+    _rd = new std::random_device();
+    _gen = new std::mt19937((*_rd)());
+    _dis = new std::uniform_real_distribution<>(0, 1);
+  }
+
+  // Original constructor for DiskANN format
   graph_partitioner(const char *indexName, const char *data_type = "uint8",
                     bool load_disk = true, unsigned BS = 1, bool visual = false,
                     std::string freq_file = std::string(""), unsigned cut = INF) {
@@ -210,6 +220,207 @@ class graph_partitioner {
       std::cout.flush();
     }
   }
+
+  /**
+   * Load custom 3-file separated topology graph
+   * @param graph_file Path to graph topology file
+   * @param meta_file Path to meta file (8KB aligned header)
+   * @param ep_size Number of entry points
+   *
+   * Meta file format (8KB aligned):
+   *   - node_num (uint32_t): total number of nodes
+   *   - emb_dim (uint32_t): embedding vector dimension
+   *   - loc_dim (uint32_t): location vector dimension
+   *   - max_nbr_len (uint32_t): maximum number of neighbors
+   *   - max_alpha_range_len (uint32_t): alpha range pairs length per neighbor
+   *   - nnodes_per_sector (uint64_t): number of nodes per sector/page
+   *   - enterpoint_set[ep_size] (uint32_t[]): entry point array
+   *
+   * Graph file format (fixed-size nodes):
+   *   - Each node: [4B nbr_count][max_nbr_len × (4B neighbor_id + 2B×max_alpha_range_len alpha_pairs)]
+   */
+  void load_custom_topology_graph(const char* graph_file, const char* meta_file,
+                                  unsigned ep_size = 1) {
+    std::cout << "Loading custom topology graph..." << std::endl;
+    std::cout << "  Graph file: " << graph_file << std::endl;
+    std::cout << "  Meta file: " << meta_file << std::endl;
+
+    // 1. Read meta file
+    std::ifstream meta_in(meta_file, std::ios::binary);
+    if (!meta_in.is_open()) {
+      std::cout << "Cannot open meta file: " << meta_file << std::endl;
+      exit(-1);
+    }
+
+    uint32_t emb_dim, loc_dim;
+    uint32_t max_nbr_len, max_alpha_range_len;
+    uint64_t nnodes_per_sector_meta;
+
+    meta_in.read((char*)&_nd, sizeof(uint32_t));           // node_num
+    meta_in.read((char*)&emb_dim, sizeof(uint32_t));        // emb_dim
+    meta_in.read((char*)&loc_dim, sizeof(uint32_t));        // loc_dim
+    meta_in.read((char*)&max_nbr_len, sizeof(uint32_t));    // max_nbr_len
+    meta_in.read((char*)&max_alpha_range_len, sizeof(uint32_t)); // max_alpha_range_len
+    meta_in.read((char*)&nnodes_per_sector_meta, sizeof(uint64_t)); // nnodes_per_sector
+
+    std::vector<uint32_t> enterpoint_set(ep_size);
+    meta_in.read((char*)enterpoint_set.data(), ep_size * sizeof(uint32_t));
+    meta_in.close();
+
+    std::cout << "  Meta info:" << std::endl;
+    std::cout << "    node_num: " << _nd << std::endl;
+    std::cout << "    emb_dim: " << emb_dim << std::endl;
+    std::cout << "    loc_dim: " << loc_dim << std::endl;
+    std::cout << "    max_nbr_len: " << max_nbr_len << std::endl;
+    std::cout << "    max_alpha_range_len: " << max_alpha_range_len << std::endl;
+    std::cout << "    nnodes_per_sector: " << nnodes_per_sector_meta << std::endl;
+
+    // 2. Calculate fixed topology node size
+    // fixed_topo_size = 4 + max_nbr_len * (4 + max_alpha_range_len * 2)
+    uint64_t alpha_pairs_size = max_alpha_range_len * 2;  // int8_t per pair
+    uint64_t neighbor_size = 4 + alpha_pairs_size;       // neighbor_id + alpha pairs
+    uint64_t fixed_topo_size = 4 + max_nbr_len * neighbor_size;
+
+    std::cout << "    fixed_topo_size: " << fixed_topo_size << " bytes" << std::endl;
+
+    // 3. Calculate page size (sector size)
+    // page_size = nnodes_per_sector * fixed_topo_size
+    // But if fixed_topo_size * nnodes_per_sector doesn't evenly divide page_size,
+    // we need to check if the file matches the expected paged layout
+    uint64_t page_size = nnodes_per_sector_meta * fixed_topo_size;
+
+    // Actually, page size should be determined differently
+    // If each page is filled with紧密排列 (densely packed) nodes,
+    // then page_size = nnodes_per_sector * fixed_topo_size + padding
+    // But we know page_size should be 8192 based on user's input
+    // Let's auto-detect: file_size / node_num gives average size
+    // and we know page_size is a power of 2 or standard size like 8192
+
+    // For now, let's calculate page size from nnodes_per_sector
+    // and verify the layout
+    uint64_t calculated_page_size = nnodes_per_sector_meta * fixed_topo_size;
+    if (calculated_page_size > 8192) {
+        // This means nodes are smaller than expected, or nnodes_per_sector is wrong
+        // Try swapping interpretation
+        calculated_page_size = 8192;  // assume standard page size
+    }
+
+    // Verify graph file size with page padding
+    size_t actual_graph_size = get_file_size(graph_file);
+    // Expected size = full pages * page_size + last_page_padding
+    uint64_t nodes_per_page = 8192 / fixed_topo_size;  // floor
+    uint64_t full_pages = _nd / nodes_per_page;
+    uint64_t remainder = _nd % nodes_per_page;
+    size_t expected_with_padding;
+    if (remainder == 0) {
+        expected_with_padding = full_pages * 8192;
+    } else {
+        // Last page has some nodes and padding to fill the page
+        expected_with_padding = (full_pages + 1) * 8192;
+    }
+
+    if (actual_graph_size != expected_with_padding) {
+      std::cout << "Graph file size mismatch!" << std::endl;
+      std::cout << "  Expected (with page padding): " << expected_with_padding << std::endl;
+      std::cout << "  Actual: " << actual_graph_size << std::endl;
+      std::cout << "  Using page_size: 8192" << std::endl;
+      std::cout << "  Nodes per page: " << nodes_per_page << std::endl;
+      std::cout << "  Full pages: " << full_pages << std::endl;
+      std::cout << "  Remainder nodes: " << remainder << std::endl;
+      exit(-1);
+    }
+
+    // Use 8192 as page size
+    page_size = 8192;
+    nnodes_per_sector_meta = nodes_per_page;
+    std::cout << "  Auto-detected page_size: " << page_size << " bytes" << std::endl;
+    std::cout << "  Nodes per page: " << nodes_per_page << std::endl;
+
+    // 4. Read graph file with proper page offset calculation
+    std::ifstream graph_in(graph_file, std::ios::binary);
+    if (!graph_in.is_open()) {
+      std::cout << "Cannot open graph file: " << graph_file << std::endl;
+      exit(-1);
+    }
+
+    direct_graph.resize(_nd);
+    full_graph.resize(_nd);
+
+    std::vector<char> node_buf(fixed_topo_size);
+    uint64_t total_edges = 0;
+
+    std::cout << "  Reading nodes with page layout (page_size=" << page_size
+              << ", nodes_per_page=" << nodes_per_page << ")..." << std::endl;
+
+    for (uint32_t i = 0; i < _nd; i++) {
+      // Calculate file offset considering page padding:
+      // page_index = i / nodes_per_page
+      // offset_in_page = (i % nodes_per_page) * fixed_topo_size
+      // file_offset = page_index * page_size + offset_in_page
+      uint64_t page_index = i / nodes_per_page;
+      uint64_t offset_in_page = (i % nodes_per_page) * fixed_topo_size;
+      uint64_t file_offset = page_index * page_size + offset_in_page;
+
+      // Seek and read
+      graph_in.seekg(file_offset, std::ios::beg);
+      graph_in.read(node_buf.data(), fixed_topo_size);
+
+      uint32_t nbr_count = *(uint32_t*)node_buf.data();
+      char* nbr_data = node_buf.data() + 4;
+
+      full_graph[i].reserve(nbr_count);
+      for (uint32_t j = 0; j < nbr_count; j++) {
+        uint32_t neighbor_id = *(uint32_t*)(nbr_data + j * neighbor_size);
+        full_graph[i].push_back(neighbor_id);
+      }
+      total_edges += nbr_count;
+    }
+    graph_in.close();
+
+    std::cout << "  Loaded " << _nd << " nodes with " << total_edges << " edges" << std::endl;
+    std::cout << "  Average degree: " << (double)total_edges / _nd << std::endl;
+
+    // 5. Copy to direct_graph (already done above)
+    direct_graph = full_graph;
+
+    // 6. Calculate partition info
+    // For custom format, use nnodes_per_sector from meta as partition size
+    C = nnodes_per_sector_meta;
+    _partition_number = ROUND_UP(_nd, C) / C;
+
+    std::cout << "  Partition info:" << std::endl;
+    std::cout << "    C (partition_size): " << C << std::endl;
+    std::cout << "    _partition_number: " << _partition_number << std::endl;
+
+    // 7. Build reverse graph
+    build_reverse_graph_internal();
+
+    // 8. Initialize mutexes for partitions
+    for (unsigned i = 0; i < _partition_number; i++) {
+      pmutex.push_back(std::make_unique<std::mutex>());
+    }
+
+    cursize = _nd / 1000;
+    std::cout << "Custom topology graph loaded successfully." << std::endl;
+  }
+
+  /**
+   * Build reverse graph (who points to me)
+   * Called internally after loading graph
+   */
+  void build_reverse_graph_internal() {
+    std::vector<std::mutex> ms(_nd);
+    reverse_graph.resize(_nd);
+#pragma omp parallel for shared(reverse_graph, direct_graph)
+    for (unsigned i = 0; i < _nd; i++) {
+      for (unsigned j = 0; j < direct_graph[i].size(); j++) {
+        std::lock_guard<std::mutex> lock(ms[direct_graph[i][j]]);
+        reverse_graph[direct_graph[i][j]].emplace_back(i);
+      }
+    }
+    std::cout << "Reverse graph built." << std::endl;
+  }
+
   /**
    * load vamana graph index from disk
    * @param filename

@@ -3,6 +3,15 @@ project(SSD_Based_Plan)
 set(CMAKE_CXX_STANDARD 17)
 include_directories(include)
 
+# Enable AddressSanitizer in Debug mode
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
+    message(STATUS "Enabling AddressSanitizer (ASan)")
+    set(SANITIZE_FLAGS "-fsanitize=address -fno-omit-frame-pointer -g")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SANITIZE_FLAGS}")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SANITIZE_FLAGS}")
+    set(CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} ${SANITIZE_FLAGS}")
+endif()
+
 #tbb
 set(TBB_TEST OFF CACHE BOOL "TBB Test" FORCE)
 add_subdirectory(oneTBB)
